@@ -2,9 +2,11 @@
 import argparse
 import copy
 import csv
+import gzip
 import io
 import json
 import math
+import os
 import re
 import secrets
 import sqlite3
@@ -18,6 +20,10 @@ import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import appraisal
+from vault import Vault
+import ledger
+from appraisal import Appraiser, RoutingClient, DEFAULT_APPRAISAL, DEFAULT_DISCORD, DEFAULT_THRESHOLDS, MODELS
 from connection import RemoteProvider, Connection, ProviderError
 
 ROOT = Path(__file__).resolve().parent
@@ -39,20 +45,30 @@ GENERIC_PROFILE = dict(copy.deepcopy(DEFAULT_PROFILE), id="general", name="Nouve
     kind="general", enabled=False, queries=[""], generations=[], require_sodimm=False,
     capacities=[], max_per_gb=0, max_price=200, exclude=["defectueux", "pour pieces"],
     resale_target=0, resale_capacity=0, min_margin=0)
+CLOTHING_BRANDS = ["Stone Island", "CP Company", "Arc'teryx", "Acne Studios", "Maison Margiela", "Rick Owens", "Raf Simons",
+                   "Carhartt WIP", "Supreme", "Stüssy", "Ralph Lauren vintage"]
+CLOTHING_PROFILE = dict(copy.deepcopy(GENERIC_PROFILE), id="clothing", name="Vêtements de marques", kind="clothing", enabled=True,
+    queries=list(CLOTHING_BRANDS), brands=list(CLOTHING_BRANDS), min_price=15, max_price=400,
+    exclude=["fake", "réplique", "copie", "contrefaçon", "défaut", "défectueux", "taille enfant", "enfant", "kids", "junior", "pour pièces"])
+PROFILE_BASES = {"general": GENERIC_PROFILE, "clothing": CLOTHING_PROFILE}
 DEFAULT_APPEARANCE = {"theme": "light", "accent": "copper", "density": "comfortable", "layout": "list", "show_margin": True, "show_score": False}
-DEFAULT_CONFIG = {"interval_seconds": 300, "per_page": 48, "pages": 1, "notify_initial": False, "appearance": DEFAULT_APPEARANCE, "profiles": [DEFAULT_PROFILE,
+DEFAULT_CONFIG = {"interval_seconds": 300, "per_page": 48, "pages": 1, "notify_initial": False, "appearance": DEFAULT_APPEARANCE,
+    "thresholds": DEFAULT_THRESHOLDS, "appraisal": DEFAULT_APPRAISAL, "discord": DEFAULT_DISCORD, "profiles": [DEFAULT_PROFILE,
     dict(copy.deepcopy(DEFAULT_PROFILE), id="ddr4", name="SO-DIMM DDR4", enabled=False,
          generations=[4], queries=["sodimm ddr4", "ram portable ddr4"], max_price=40,
-         max_per_gb=3, resale_target=0, min_margin=0)]}
+         max_per_gb=3, resale_target=0, min_margin=0),
+    dict(copy.deepcopy(CLOTHING_PROFILE), enabled=False)]}
 
 
 def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+MARKS = re.compile("[\u0300-\u036f]")
+
+
 def normalize(text):
-    return "".join(c for c in unicodedata.normalize("NFKD", str(text)).lower()
-                   if not unicodedata.combining(c)).replace("×", "x")
+    return MARKS.sub("", unicodedata.normalize("NFKD", str(text)).lower()).replace("×", "x")
 
 
 def number(value, default=None):
@@ -84,6 +100,12 @@ def specs(title, description=""):
             "ambiguous": len(generations) > 1 or ambiguous_capacity}
 
 
+def vinted_image(value):
+    url = urllib.parse.urlparse(str(value or ""))
+    ok = url.scheme == "https" and (url.hostname or "").endswith(".vinted.net") and not url.username
+    return str(value) if ok else ""
+
+
 def canonical_item(raw):
     if not isinstance(raw, dict):
         raise ValueError("Chaque annonce doit être un objet JSON.")
@@ -105,14 +127,17 @@ def canonical_item(raw):
     if not brand and isinstance(box.get("first_line"), str) and box["first_line"] != title:
         brand = box["first_line"]
     photo = raw.get("photo") if isinstance(raw.get("photo"), dict) else {}
-    image = str(photo.get("url") or raw.get("image") or "")
-    image_url = urllib.parse.urlparse(image)
-    if image_url.scheme != "https" or not (image_url.hostname or "").endswith(".vinted.net") or image_url.username:
-        image = ""
+    image = vinted_image(photo.get("url") or raw.get("image"))
+    photos = [vinted_image(p.get("url") if isinstance(p, dict) else p) for p in raw.get("photos", [])[:6]] if isinstance(raw.get("photos"), list) else []
+    photos = [p for p in photos if p][:4]
+    shipping = number(raw.get("shipping_price", raw.get("shipping")))
     return {"id": item_id, "title": title, "description": str(raw.get("description", ""))[:15000],
             "profile_ids": [str(x) for x in raw.get("profile_ids", [])][:20] if isinstance(raw.get("profile_ids", []), list) else [],
             "price": round(price, 2), "currency": currency, "url": url,
-            "brand": str(brand), "image": image,
+            "brand": str(brand), "image": image, "photos": photos or ([image] if image else []),
+            "size": str(raw.get("size_title") or raw.get("size") or "")[:50],
+            "condition": str(raw.get("condition") or raw.get("status") or "")[:60],
+            "shipping": round(shipping, 2) if shipping is not None and 0 <= shipping <= 1000 else None,
             "rating": number(raw.get("rating")), "reviews": number(raw.get("reviews")),
             "seller": str(seller.get("login") or raw.get("seller") or ""),
             "sold": bool(raw.get("sold") or raw.get("is_sold") or raw.get("is_reserved"))}
@@ -131,14 +156,17 @@ def evaluate(item, profile):
     if ram and profile["generations"] and s["generation"] not in profile["generations"]: reasons.append("Génération absente ou différente")
     if ram and profile["require_sodimm"] and not s["sodimm"]: reasons.append("Format SO-DIMM non confirmé")
     contains = lambda word: bool(re.search(r"(?<!\w)" + re.escape(normalize(word)) + r"(?!\w)", text))
+    flatten = lambda value: re.sub(r"[^a-z0-9]", "", normalize(value))
+    flat_text = re.sub(r"[^a-z0-9]", "", text)
     if not ram and not item.get("profile_ids"):
-        clauses = [re.findall(r"\w+", normalize(query)) for query in profile["queries"]]
-        if not any(words and all(contains(word) for word in words) for words in clauses):
+        clauses = [(re.findall(r"\w+", normalize(query)), flatten(query)) for query in profile["queries"]]
+        if not any((words and all(contains(word) for word in words)) or (len(flat) >= 6 and flat in flat_text) for words, flat in clauses):
             reasons.append("Le texte importé ne correspond pas aux recherches")
     if any(not contains(word) for word in profile["required_all"]): reasons.append("Un mot obligatoire est absent")
     if profile["required_any"] and not any(contains(word) for word in profile["required_any"]): reasons.append("Aucun des mots souhaités")
+    claims = re.sub(r"(?<!\w)(?:sans|aucun|pas de)\s+defauts?(?!\w)", " ", text)
     for word in profile["exclude"]:
-        if re.search(r"(?<!\w)" + re.escape(normalize(word)) + r"(?!\w)", text):
+        if re.search(r"(?<!\w)" + re.escape(normalize(word)) + r"(?!\w)", claims):
             reasons.append("Exclusion : " + word)
     if ram and s["ambiguous"]: reasons.append("Caractéristiques ambiguës")
     if ram and s["capacity"] is None and not profile["allow_unknown_capacity"]: reasons.append("Capacité inconnue")
@@ -146,7 +174,8 @@ def evaluate(item, profile):
     per_gb = round(item["price"] / s["capacity"], 2) if ram and s["capacity"] else None
     if per_gb is not None and profile["max_per_gb"] and per_gb > profile["max_per_gb"]: reasons.append("Prix par Go trop élevé")
     if ram and profile["min_speed"] and (s["speed"] or 0) < profile["min_speed"]: reasons.append("Fréquence insuffisante ou inconnue")
-    if profile["brands"] and not any(normalize(b) in normalize(item["brand"] + " " + text) for b in profile["brands"]): reasons.append("Marque hors sélection")
+    flat_brands = [flatten(b) for b in profile["brands"]]
+    if flat_brands and not any(b and b in flatten(item["brand"]) + flat_text for b in flat_brands): reasons.append("Marque hors sélection")
     for key, field in [("min_rating", "rating"), ("min_reviews", "reviews")]:
         if profile[key] and (item[field] is None or item[field] < profile[key]): reasons.append("Informations vendeur insuffisantes : " + field)
     landed = round(item["price"] * (1 + profile["buyer_fee_percent"] / 100) + profile["buyer_fee_fixed"] + profile["shipping"] + profile["conversion_cost"], 2)
@@ -161,6 +190,29 @@ def evaluate(item, profile):
             "margin": margin, "score": score, "profile_id": profile["id"], "profile_name": profile["name"]}
 
 
+def whole(value, low, high, label):
+    if type(value) is not int or not low <= value <= high: raise ValueError(f"{label} : entier de {low} à {high}.")
+    return value
+
+
+def validate_appraisal(raw):
+    if not isinstance(raw, dict): raise ValueError("Réglages d'évaluation invalides.")
+    merged = dict(DEFAULT_APPRAISAL, **raw)
+    for key in ("enabled", "web_search"):
+        if type(merged[key]) is not bool: raise ValueError("Booléen attendu : " + key)
+    below = number(merged["search_below"])
+    if type(merged["search_below"]) is bool or below is None or not 0 <= below <= 1: raise ValueError("Confiance de recherche web : entre 0 et 1.")
+    if merged["model"] not in MODELS: raise ValueError("Modèle inconnu : choisir dans la liste.")
+    return {"enabled": merged["enabled"], "web_search": merged["web_search"], "search_below": below, "model": merged["model"],
+            "daily_cap": whole(merged["daily_cap"], 0, 100000, "Plafond quotidien"), "batch_size": whole(merged["batch_size"], 1, 500, "Taille du lot"), "batch_items": whole(merged["batch_items"], 1, 50, "Annonces par requête"), "max_age_hours": whole(merged["max_age_hours"], 1, 720, "Âge maximal"),
+            "photos": whole(merged["photos"], 0, 4, "Photos")}
+
+
+def validate_discord(raw):
+    if not isinstance(raw, dict): raise ValueError("Réglages Discord invalides.")
+    return {"max_age_hours": whole(dict(DEFAULT_DISCORD, **raw)["max_age_hours"], 1, 720, "Âge maximal Discord")}
+
+
 def validate_config(config):
     if not isinstance(config, dict): raise ValueError("Configuration invalide.")
     interval = number(config.get("interval_seconds"))
@@ -170,14 +222,14 @@ def validate_config(config):
     result, ids = [], set()
     for raw in profiles:
         if not isinstance(raw, dict): raise ValueError("Profil invalide.")
-        base = GENERIC_PROFILE if raw.get("kind") == "general" else DEFAULT_PROFILE
+        base = PROFILE_BASES.get(raw.get("kind") if isinstance(raw.get("kind"), str) else None, DEFAULT_PROFILE)
         p = dict(copy.deepcopy(base), **{k: v for k, v in raw.items() if k in DEFAULT_PROFILE})
-        if p["kind"] not in ["general", "ram"]: raise ValueError("Type de recherche inconnu.")
+        if p["kind"] not in ["general", "ram", "clothing"]: raise ValueError("Type de recherche inconnu.")
         if not isinstance(p["id"], str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,50}", p["id"]) or p["id"] in ids: raise ValueError("Identifiant de profil invalide ou dupliqué.")
         ids.add(p["id"])
         if not isinstance(p["name"], str) or not 1 <= len(p["name"]) <= 100: raise ValueError("Nom de profil invalide.")
         for k in ["queries", "exclude", "brands", "required_all", "required_any"]:
-            if not isinstance(p[k], list) or len(p[k]) > 20 or any(not isinstance(x, str) or not 1 <= len(x.strip()) <= 150 for x in p[k]): raise ValueError("Liste invalide : " + k)
+            if not isinstance(p[k], list) or len(p[k]) > 60 or any(not isinstance(x, str) or not 1 <= len(x.strip()) <= 150 for x in p[k]): raise ValueError("Liste invalide : " + k)
         if not p["queries"]: raise ValueError("Au moins une recherche par profil.")
         for k in ["generations", "capacities", "catalog_ids", "brand_ids", "size_ids", "status_ids"]:
             if not isinstance(p[k], list) or len(p[k]) > 30 or any(type(x) is not int or x < 1 or x > 10000000 for x in p[k]): raise ValueError("Valeurs invalides : " + k)
@@ -201,13 +253,23 @@ def validate_config(config):
     if type(per_page) is not int or not 1 <= per_page <= 96: raise ValueError("Résultats par page : 1 à 96.")
     notify_initial = config.get("notify_initial", False)
     if type(notify_initial) is not bool: raise ValueError("Option d'alertes invalide.")
+    raw_limits = config.get("thresholds", DEFAULT_THRESHOLDS)
+    if not isinstance(raw_limits, dict): raise ValueError("Seuils invalides.")
+    limits = {}
+    for key in DEFAULT_THRESHOLDS:
+        value = number(raw_limits.get(key, DEFAULT_THRESHOLDS[key]))
+        if value is None or not 1 <= value <= 100: raise ValueError("Seuil invalide (1 à 100) : " + key)
+        limits[key] = value
+    if limits["panel"] > limits["alert"]: raise ValueError("Le seuil du panel ne peut pas dépasser celui des annonces.")
     return {"interval_seconds": int(interval), "pages": pages, "per_page": per_page, "notify_initial": notify_initial,
-            "appearance": {k: appearance[k] for k in DEFAULT_APPEARANCE}, "profiles": result}
+            "appearance": {k: appearance[k] for k in DEFAULT_APPEARANCE}, "thresholds": limits, "appraisal": validate_appraisal(config.get("appraisal", {})),
+            "discord": validate_discord(config.get("discord", {})), "profiles": result}
 
 
 class Store:
     def __init__(self, path):
         self.lock = threading.RLock()
+        self.version, self.summary_cache = 0, None
         self.db = sqlite3.connect(str(path), check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript('''
@@ -219,7 +281,14 @@ class Store:
             CREATE INDEX IF NOT EXISTS prices_by_item ON prices(item_id, id);
             CREATE INDEX IF NOT EXISTS items_by_seen ON items(last_seen DESC);
         ''')
-        self.set("config", validate_config(self.get("config") or DEFAULT_CONFIG))
+        ledger.ensure_schema(self.db)
+        appraisal.ensure_schema(self.db)
+        stored = self.get("config") or DEFAULT_CONFIG
+        if isinstance(stored, dict) and isinstance(stored.get("profiles"), list) and not any(isinstance(x, dict) and x.get("id") == "clothing" for x in stored["profiles"]):
+            stored["profiles"].append(copy.deepcopy(DEFAULT_CONFIG["profiles"][2]))
+        if isinstance(stored, dict) and isinstance(stored.get("appraisal"), dict) and stored["appraisal"].get("model") not in MODELS:
+            stored["appraisal"]["model"] = DEFAULT_APPRAISAL["model"]
+        self.set("config", validate_config(stored))
 
     def get(self, key):
         with self.lock:
@@ -229,6 +298,12 @@ class Store:
     def set(self, key, value):
         with self.lock, self.db:
             self.db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, json.dumps(value)))
+            if key == "config": self.version += 1
+
+    def item(self, item_id):
+        with self.lock:
+            row = self.db.execute("SELECT data FROM items WHERE id=?", (str(item_id),)).fetchone()
+            return json.loads(row[0]) if row else None
 
     def ingest(self, items, source, notify=True, profile_id=None):
         # Validate the complete batch before making any changes.
@@ -247,25 +322,42 @@ class Store:
                 if changed:
                     self.db.execute("INSERT INTO prices(item_id,price,at) VALUES (?,?,?)", (item["id"], item["price"], at))
                 matches = [evaluate(item, p) for p in profiles]
-                if notify and any(m["matched"] for m in matches) and (old is None or item["price"] < old["price"]):
+                if any(m["matched"] and m["kind"] == "clothing" for m in matches): appraisal.enqueue(self.db, item["id"])
+                if changed and old is not None: ledger.bump(self.db)
+                if notify and any(m["matched"] and m["kind"] != "clothing" for m in matches) and (old is None or item["price"] < old["price"]):
                     kind = "new" if old is None else "price_drop"
                     message = ("Nouvelle annonce" if old is None else f"Baisse : {old['price']:.2f} € → {item['price']:.2f} €") + " · " + item["title"]
                     self.db.execute("INSERT INTO events(item_id,kind,message,at) VALUES (?,?,?,?)", (item["id"], kind, message, at))
                     count += 1
             self.db.execute("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 2000)")
+            self.version += 1
         return {"processed": len(items), "alerts": count}
 
-    def listing(self):
+    def listing(self, full=True):
         with self.lock:
+            if not full and self.summary_cache and self.summary_cache[0] == self.version: return self.summary_cache[1]
+            version = self.version
             profiles = [p for p in self.get("config")["profiles"] if p["enabled"]]
-            result = []
-            for row in self.db.execute("SELECT * FROM items ORDER BY last_seen DESC LIMIT 2000"):
-                item = json.loads(row["data"])
-                evaluations = [evaluate(item, p) for p in profiles]
-                matches = sorted([e for e in evaluations if e["matched"]], key=lambda x: x["score"], reverse=True)
-                history = [dict(p) for p in self.db.execute("SELECT price,at FROM prices WHERE item_id=? ORDER BY id", (item["id"],))]
-                result.append(dict(item, first_seen=row["first_seen"], last_seen=row["last_seen"], source=row["source"], favorite=bool(row["favorite"]), hidden=bool(row["hidden"]), matches=matches, evaluations=evaluations, history=history))
+            result = [self.present(row, profiles, full) for row in self.db.execute("SELECT * FROM items ORDER BY last_seen DESC LIMIT 2000")]
+            if not full: self.summary_cache = (version, result)
             return result
+
+    def present(self, row, profiles, full):
+        item = json.loads(row["data"])
+        evaluations = [evaluate(item, p) for p in profiles]
+        matches = sorted([e for e in evaluations if e["matched"]], key=lambda x: x["score"], reverse=True)
+        base = dict(item, first_seen=row["first_seen"], last_seen=row["last_seen"], source=row["source"], favorite=bool(row["favorite"]), hidden=bool(row["hidden"]), matches=matches)
+        if not full:
+            for key in ("description", "photos"): base.pop(key, None)
+            return base
+        history = [dict(p) for p in self.db.execute("SELECT price,at FROM prices WHERE item_id=? ORDER BY id", (item["id"],))]
+        return dict(base, evaluations=evaluations, history=history)
+
+    def detail(self, item_id):
+        with self.lock:
+            row = self.db.execute("SELECT * FROM items WHERE id=?", (str(item_id),)).fetchone()
+            if row is None: raise ValueError("Annonce inconnue.")
+            return self.present(row, [p for p in self.get("config")["profiles"] if p["enabled"]], True)
 
 
 def parse_search_url(url):
@@ -355,8 +447,12 @@ class Monitor:
 
 
 
-def make_handler(store, monitor, port, connection=None):
+def make_handler(store, monitor, port, connection=None, appraiser=None, vault=None, remote=None):
     token = secrets.token_urlsafe(32)
+    remote = remote or {}
+    remote_hosts, remote_logins = set(remote.get("hosts", [])), set(remote.get("logins", []))
+    local = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    idle = {"configured": False, "model": "", "pending": 0, "expired": 0, "done": 0, "failed": 0, "enabled": True, "calls_today": 0, "daily_cap": 0, "error": "", "blocked_until": 0}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args): pass
@@ -365,6 +461,10 @@ def make_handler(store, monitor, port, connection=None):
             body = json.dumps(data, ensure_ascii=False).encode() if mime == "application/json" else data.encode() if isinstance(data, str) else data
             self.send_response(status)
             self.send_header("Content-Type", mime + "; charset=utf-8")
+            if len(body) > 1024 and "gzip" in self.headers.get("Accept-Encoding", ""):
+                body = gzip.compress(body, 5)
+                self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
@@ -373,27 +473,44 @@ def make_handler(store, monitor, port, connection=None):
             self.wfile.write(body)
 
         def valid_host(self):
-            return self.headers.get("Host") in {f"127.0.0.1:{port}", f"localhost:{port}"}
+            host = self.headers.get("Host") or ""
+            if host in local: return True
+            if host.split(":")[0] not in remote_hosts: return False
+            return not remote_logins or self.headers.get("Tailscale-User-Login") in remote_logins
 
         def do_GET(self):
             if not self.valid_host(): return self.respond({"error": "Hôte refusé"}, 403)
-            path = urllib.parse.urlparse(self.path).path
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            if path == "/api/item":
+                try: return self.respond(store.detail(urllib.parse.parse_qs(parsed.query).get("id", [""])[0]))
+                except ValueError as error: return self.respond({"error": str(error)}, 404)
             if path == "/api/state":
                 with store.lock:
                     events = [dict(r) for r in store.db.execute("SELECT * FROM events ORDER BY id DESC LIMIT 100")]
-                return self.respond({"config": store.get("config"), "status": monitor.status(), "items": store.listing(), "events": events, "token": token,
-                    "connection": connection.public() if connection else {"configured": False}, "templates": {"general": GENERIC_PROFILE, "ddr5": DEFAULT_PROFILE, "ddr4": DEFAULT_CONFIG["profiles"][1]}, "version": "2.0.0"})
+                    version = store.version
+                known = urllib.parse.parse_qs(parsed.query).get("v", [""])[0] == str(version)
+                return self.respond({"config": store.get("config"), "status": monitor.status(), "items": None if known else store.listing(False), "items_version": version, "events": events, "token": token,
+                    "connection": connection.public() if connection else {"configured": False}, "secrets": vault.status() if vault else {}, "appraisal": appraiser.status() if appraiser else idle,
+                    "templates": {"general": GENERIC_PROFILE, "ddr5": DEFAULT_PROFILE, "ddr4": DEFAULT_CONFIG["profiles"][1], "clothing": CLOTHING_PROFILE}, "version": "2.1.0"})
+            if path in ("/api/offers", "/api/ledger"):
+                with store.lock: rev = ledger.revision(store.db)
+                if urllib.parse.parse_qs(parsed.query).get("rev", [""])[0] == str(rev): return self.respond({"rev": rev, "unchanged": True})
+                if path == "/api/ledger": return self.respond(ledger.snapshot(store))
+                return self.respond({"rev": rev, "offers": appraisal.offers(store), "thresholds": appraisal.thresholds_of(store.get("config")),
+                    "appraisal": appraiser.status() if appraiser else idle})
             if path == "/api/config": return self.respond(store.get("config"))
             if path == "/api/export.csv":
                 out = io.StringIO()
                 writer = csv.writer(out)
                 writer.writerow(["id", "titre", "prix", "url", "source", "profil", "cout_estime", "marge_hypothese"])
-                for item in store.listing():
+                for item in store.listing(False):
                     for match in item["matches"]:
                         row = [item["id"], item["title"], item["price"], item["url"], item["source"], match["profile_name"], match["landed"], match["margin"]]
                         writer.writerow(["'" + v if isinstance(v, str) and v.startswith(("=", "+", "-", "@", "\t", "\r")) else v for v in row])
                 return self.respond(out.getvalue(), mime="text/csv")
-            files = {"/": ("index.html", "text/html"), "/app.js": ("app.js", "text/javascript"), "/style.css": ("style.css", "text/css")}
+            files = {"/": ("index.html", "text/html"), "/contemporary": ("index.html", "text/html"), "/bilan": ("index.html", "text/html"),
+                     "/app.js": ("app.js", "text/javascript"), "/offers.js": ("offers.js", "text/javascript"), "/style.css": ("style.css", "text/css")}
             if path in files:
                 file, mime = files[path]
                 return self.respond((ROOT / "static" / file).read_bytes(), mime=mime)
@@ -403,14 +520,16 @@ def make_handler(store, monitor, port, connection=None):
             if not self.valid_host() or self.headers.get("X-Radar-Token") != token:
                 return self.respond({"error": "Accès refusé"}, 403)
             origin = self.headers.get("Origin")
-            if origin and origin not in {f"http://localhost:{port}", f"http://127.0.0.1:{port}"}:
+            if origin and origin not in {f"http://{h}" for h in local} and urllib.parse.urlparse(origin).netloc.split(":")[0] not in remote_hosts:
                 return self.respond({"error": "Origine refusée"}, 403)
             try:
                 size = int(self.headers.get("Content-Length", "0"))
                 if not 0 < size <= 2_000_000: raise ValueError("Corps de requête vide ou trop volumineux.")
                 data = json.loads(self.rfile.read(size))
                 if not isinstance(data, dict): raise ValueError("Objet JSON requis.")
-                if self.path == "/api/config": store.set("config", validate_config(data))
+                if self.path == "/api/config":
+                    store.set("config", validate_config(data))
+                    with store.lock, store.db: ledger.bump(store.db)
                 elif self.path == "/api/parse-search": return self.respond(parse_search_url(data.get("url")))
                 elif self.path == "/api/preview":
                     config = validate_config({"interval_seconds": 300, "profiles": [data.get("profile")]})
@@ -429,10 +548,21 @@ def make_handler(store, monitor, port, connection=None):
                     items = data.get("items")
                     if not isinstance(items, list) or len(items) > 1000: raise ValueError("Liste de 1000 annonces maximum.")
                     return self.respond(store.ingest(items, "import"))
+                elif self.path == "/api/trade":
+                    if data.get("action") == "buy":
+                        return self.respond(ledger.record_purchase(store, data.get("id"), data.get("buy_price"), data.get("sell_price"), data.get("platform"), data.get("fees")))
+                    if data.get("action") == "sell":
+                        return self.respond(ledger.record_sale(store, data.get("id"), data.get("sell_price"), data.get("platform"), data.get("fees")))
+                    raise ValueError("Action inconnue.")
+                elif self.path == "/api/appraisal/retry": appraisal.retry(store, data.get("id"))
+                elif self.path == "/api/secret":
+                    if vault is None: raise ValueError("Coffre indisponible.")
+                    vault.set(data.get("name"), data.get("value", ""))
                 elif self.path == "/api/item":
                     if data.get("field") not in ["favorite", "hidden"] or type(data.get("value")) is not bool: raise ValueError("Modification invalide.")
                     with store.lock, store.db:
                         store.db.execute("UPDATE items SET " + data["field"] + "=? WHERE id=?", (int(data["value"]), str(data.get("id"))))
+                        store.version += 1
                 else: return self.respond({"error": "Introuvable"}, 404)
                 self.respond({"ok": True})
             except (ValueError, TypeError, KeyError) as error:
@@ -460,20 +590,42 @@ def main():
     store = Store(args.data_dir / "radar.sqlite3")
     connection = Connection(args.data_dir / "connection.json")
     monitor = Monitor(store, RemoteProvider(connection))
+    vault = Vault(args.data_dir / "secrets.json")
+    appraiser = Appraiser(store, RoutingClient(vault), pause=2.1)
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(store, monitor, args.port, connection))
+        remote = json.loads((args.data_dir / "remote.json").read_text(encoding="utf-8"))
+        if not isinstance(remote, dict): remote = {}
+    except (OSError, ValueError):
+        remote = {}
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(store, monitor, args.port, connection, appraiser, vault, remote))
     except OSError as error:
         print(f"Impossible de démarrer sur le port {args.port} : {error}. Essaie --port 8766.")
         store.db.close()
         raise SystemExit(1)
     monitor.thread.start()
+    appraiser.thread.start()
+    start_discord(store, vault)
+    if not any(vault.get(name) for name in ("ANTHROPIC_API_KEY", "NVIDIA_API_KEY", "GROQ_API_KEY")): print("Aucune clé d'IA enregistrée : les annonces restent en attente d'évaluation.", flush=True)
     print(f"Repère : http://127.0.0.1:{args.port} — Ctrl+C pour arrêter", flush=True)
     if args.open: webbrowser.open(f"http://127.0.0.1:{args.port}")
     try: server.serve_forever()
     except KeyboardInterrupt: pass
     finally:
         monitor.stop_event.set()
+        appraiser.stop_event.set()
         server.server_close()
+
+
+def start_discord(store, vault=None):
+    env = vault.merged() if vault else dict(os.environ)
+    if not env.get("DISCORD_TOKEN"): return None
+    try:
+        import bot
+    except ImportError:
+        print("DISCORD_TOKEN défini mais discord.py ou matplotlib est absent : pip install -r requirements.txt", flush=True)
+        return None
+    return bot.start_thread(store, env)
 
 
 if __name__ == "__main__": main()
